@@ -9,6 +9,7 @@ from tools.memory_tool import (
     memory_tool,
     _scan_memory_content,
     MEMORY_SCHEMA,
+    ENTRY_DELIMITER,
 )
 
 
@@ -291,16 +292,69 @@ class TestMemoryStoreAdd:
         assert result["success"] is True  # No error, just a note
         assert len(store.memory_entries) == 1  # Not duplicated
 
-    def test_add_exceeding_limit_rejected(self, store):
-        # Fill up to near limit
+    def test_add_exceeding_tier1_limit_cascades_to_tier2(self, store):
+        # Fill tier1 up to near its limit (500 chars in the fixture).
         store.add("memory", "x" * 490)
-        result = store.add("memory", "this will exceed the limit")
+        result = store.add("memory", "this will exceed the tier1 limit")
+        # Tiering means this no longer fails -- the oldest tier1 entry ("x"*490)
+        # cascades down into tier2, freeing room for the new entry in tier1.
+        assert result["success"] is True
+        assert "cascad" in result["message"].lower()
+        assert "this will exceed the tier1 limit" in store.memory_entries
+        assert "x" * 490 not in store.memory_entries
+        assert "x" * 490 in store._entries_for("memory", "tier2")
+
+    def test_add_single_entry_exceeding_tier1_limit_outright_rejected(self, store):
+        # An entry that alone is bigger than the tier1 limit (500 chars) can
+        # never fit in tier1 no matter what cascades out -- reject outright,
+        # don't cascade anything.
+        result = store.add("memory", "x" * 501)
         assert result["success"] is False
-        assert "exceed" in result["error"].lower()
-        # Overflow response gives the model what it needs to consolidate in-turn
-        assert "current_entries" in result
-        assert "usage" in result
-        assert "retry" in result["error"].lower()
+        assert "exceeds the tier1" in result["error"].lower()
+
+    def test_add_cascade_fails_when_tier3_has_no_room(self, tmp_path, monkeypatch):
+        # Tiny tiers all around so we can force a genuine tier3-full refusal.
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        tiny = MemoryStore(
+            memory_char_limit=20, user_char_limit=20,
+            tier2_char_limit=20, tier3_char_limit=20,
+        )
+        tiny.load_from_disk()
+        # Fill tier3 completely so it has zero room to absorb anything cascaded into it.
+        tiny.add("memory", "x" * 20)
+        assert tiny._entries_for("memory", "tier1") == ["x" * 20]
+        # Now force tier1 to cascade its only entry toward tier2 -- but tier2
+        # will itself need to push into tier3, which is already full.
+        # First, saturate tier2 as well so it also has no room. add() reloads
+        # all tiers from disk at the start of every call, so these manual
+        # mutations must be persisted or they'll be wiped on the next add().
+        tiny._entries["memory"]["tier2"] = ["y" * 20]
+        tiny._entries["memory"]["tier3"] = ["z" * 20]
+        tiny.save_to_disk("memory", "tier2")
+        tiny.save_to_disk("memory", "tier3")
+        result = tiny.add("memory", "brand new fact")
+        assert result["success"] is False
+        assert "eviction_candidates" in result
+        assert result["eviction_candidates"]  # tier3's content surfaced, not silently dropped
+        # Nothing was mutated -- tier1 still holds only the original entry.
+        assert tiny._entries_for("memory", "tier1") == ["x" * 20]
+        assert tiny._entries_for("memory", "tier2") == ["y" * 20]
+        assert tiny._entries_for("memory", "tier3") == ["z" * 20]
+
+    def test_add_cross_tier_duplicate_is_noop(self, store):
+        store.add("memory", "fact A")
+        # Manually demote it to tier2 to simulate a prior cascade, persisting
+        # so the reload-from-disk at the start of the next add() doesn't wipe it.
+        store._entries["memory"]["tier1"] = []
+        store._entries["memory"]["tier2"] = ["fact A"]
+        store.save_to_disk("memory", "tier1")
+        store.save_to_disk("memory", "tier2")
+        result = store.add("memory", "fact A")
+        assert result["success"] is True
+        assert "already exists" in result["message"].lower()
+        # Still only in tier2 -- not duplicated into tier1.
+        assert store._entries_for("memory", "tier1") == []
+        assert store._entries_for("memory", "tier2") == ["fact A"]
 
     def test_replace_exceeding_limit_returns_consolidation_context(self, store):
         # A replace that blows the budget should mirror the add-overflow shape:
@@ -399,19 +453,35 @@ class TestMemoryConsolidationGracefulDegrade:
         assert "current_entries" not in r
         assert "continue with your reply" in r["error"]
 
-    def test_add_overflow_degrades_after_cap(self, store):
-        # Fill near the 500-char user/memory limit so add() overflows.
-        store.add("memory", "x" * 200)
-        store.add("memory", "y" * 200)
-        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
-        big = "z" * 200
+    def test_add_overflow_degrades_after_cap(self, tmp_path, monkeypatch):
+        # With tiering, a simple tier1 overflow now cascades successfully
+        # instead of failing -- to exercise the degrade-after-cap path we
+        # need a genuine tier3-full refusal, so use tiny tier2/tier3 limits
+        # that leave no room to absorb anything.
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        tiny = MemoryStore(
+            memory_char_limit=20, user_char_limit=20,
+            tier2_char_limit=20, tier3_char_limit=20,
+        )
+        tiny.load_from_disk()
+        tiny.add("memory", "x" * 20)  # fills tier1
+        tiny._entries["memory"]["tier2"] = ["y" * 20]  # fills tier2
+        tiny._entries["memory"]["tier3"] = ["z" * 20]  # fills tier3 -- nowhere left to cascade
+        # Persist -- add() reloads all tiers from disk at the start of every
+        # call, so these manual mutations must be on disk or the next add()
+        # wipes them back to what load_from_disk last saw.
+        tiny.save_to_disk("memory", "tier2")
+        tiny.save_to_disk("memory", "tier3")
+
+        cap = tiny._MAX_CONSOLIDATION_FAILURES_PER_TURN
         for _ in range(cap):
-            r = store.add("memory", big)
+            r = tiny.add("memory", "brand new fact")
             assert r["success"] is False
-            assert "retry this add" in r["error"]  # still instructs in-turn retry
-        r = store.add("memory", big)
+            assert "eviction_candidates" in r  # still actionable feedback, keep trying
+        r = tiny.add("memory", "brand new fact")
         assert r["success"] is False
         assert r["done"] is True
+        assert "eviction_candidates" not in r
         assert "continue with your reply" in r["error"]
 
     def test_failures_mix_across_actions_share_one_budget(self, store):
@@ -596,14 +666,19 @@ class TestMemoryBatch:
         assert "usage" in result
 
     def test_batch_frees_room_for_otherwise_overflowing_add(self, store):
-        # store limit is 500 (fixture). Fill it, then a single add would
-        # overflow — but a batch that removes first lands in ONE call.
+        # store tier1 limit is 500 (fixture). apply_batch (unlike add()) does
+        # NOT cascade to tier2/tier3 by design -- it stays a tier1-only,
+        # atomic all-or-nothing operation. So a batch that overflows tier1
+        # still fails, and must free room itself (remove) in the same call.
         store.add("memory", "x" * 240)
         store.add("memory", "y" * 240)  # ~485 chars, near the 500 limit
         big_add = {"action": "add", "content": "z" * 200}
-        # single add overflows
-        single = json.loads(memory_tool(action="add", target="memory", content="z" * 200, store=store))
-        assert single["success"] is False
+        # A batch add alone (no removal) overflows tier1 -- apply_batch does
+        # not cascade.
+        overflow_batch = json.loads(memory_tool(
+            target="memory", operations=[big_add], store=store,
+        ))
+        assert overflow_batch["success"] is False
         # batch that removes one big entry + adds succeeds atomically
         result = json.loads(memory_tool(
             target="memory",
@@ -895,3 +970,245 @@ class TestLoadTimeSnapshotSanitization:
         # Block marker appears exactly once, not nested
         assert snapshot.count("[BLOCKED:") == 1
         assert "Clean fact" in snapshot
+
+
+# =========================================================================
+# Tiered cache: cross-tier replace/remove, search, migration
+# =========================================================================
+
+class TestTieredCrossOperations:
+    @pytest.fixture()
+    def tiered_store(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        s = MemoryStore(
+            memory_char_limit=100, user_char_limit=100,
+            tier2_char_limit=200, tier3_char_limit=400,
+        )
+        s.load_from_disk()
+        return s
+
+    def test_replace_finds_entry_demoted_to_tier2(self, tiered_store):
+        tiered_store._entries["memory"]["tier2"] = ["old fact in tier2"]
+        tiered_store.save_to_disk("memory", "tier2")
+        result = tiered_store.replace("memory", "old fact", "updated fact")
+        assert result["success"] is True
+        assert "updated fact" in tiered_store._entries_for("memory", "tier2")
+        assert "old fact in tier2" not in tiered_store._entries_for("memory", "tier2")
+        # Never touched tier1.
+        assert tiered_store._entries_for("memory", "tier1") == []
+
+    def test_replace_finds_entry_demoted_to_tier3(self, tiered_store):
+        tiered_store._entries["memory"]["tier3"] = ["deep fact in tier3"]
+        tiered_store.save_to_disk("memory", "tier3")
+        result = tiered_store.replace("memory", "deep fact", "revised deep fact")
+        assert result["success"] is True
+        assert "revised deep fact" in tiered_store._entries_for("memory", "tier3")
+
+    def test_replace_respects_hit_tiers_own_limit_not_tier1s(self, tiered_store):
+        # tier2 limit is 200 chars. Put a small entry in tier2, then try to
+        # replace it with something that fits tier1's limit (100) fine but
+        # blows tier2's own accounting relative to what's already there.
+        tiered_store._entries["memory"]["tier2"] = ["x" * 150]
+        tiered_store.save_to_disk("memory", "tier2")
+        result = tiered_store.replace("memory", "x" * 150, "y" * 250)  # exceeds tier2 limit (200)
+        assert result["success"] is False
+        assert "tier2" in result["error"].lower()
+
+    def test_remove_finds_entry_demoted_to_tier2(self, tiered_store):
+        tiered_store._entries["memory"]["tier2"] = ["stale tier2 fact"]
+        tiered_store.save_to_disk("memory", "tier2")
+        result = tiered_store.remove("memory", "stale tier2")
+        assert result["success"] is True
+        assert tiered_store._entries_for("memory", "tier2") == []
+
+    def test_remove_finds_entry_demoted_to_tier3(self, tiered_store):
+        tiered_store._entries["memory"]["tier3"] = ["stale tier3 fact"]
+        tiered_store.save_to_disk("memory", "tier3")
+        result = tiered_store.remove("memory", "stale tier3")
+        assert result["success"] is True
+        assert tiered_store._entries_for("memory", "tier3") == []
+
+    def test_replace_no_match_reports_all_tiers_in_current_entries(self, tiered_store):
+        tiered_store._entries["memory"]["tier1"] = ["tier1 fact"]
+        tiered_store._entries["memory"]["tier2"] = ["tier2 fact"]
+        tiered_store._entries["memory"]["tier3"] = ["tier3 fact"]
+        for t in ("tier1", "tier2", "tier3"):
+            tiered_store.save_to_disk("memory", t)
+        result = tiered_store.replace("memory", "nonexistent", "new")
+        assert result["success"] is False
+        assert set(result["current_entries"]) == {"tier1 fact", "tier2 fact", "tier3 fact"}
+
+
+class TestMemorySearch:
+    @pytest.fixture()
+    def tiered_store(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        s = MemoryStore(
+            memory_char_limit=100, user_char_limit=100,
+            tier2_char_limit=500, tier3_char_limit=1000,
+        )
+        s.load_from_disk()
+        s._entries["memory"]["tier1"] = ["tier1 entry about docker"]
+        s._entries["memory"]["tier2"] = ["tier2 entry about Docker networking", "unrelated tier2 fact"]
+        s._entries["memory"]["tier3"] = ["tier3 entry mentions docker compose"]
+        for t in ("tier1", "tier2", "tier3"):
+            s.save_to_disk("memory", t)
+        return s
+
+    def test_search_never_touches_tier1(self, tiered_store):
+        result = tiered_store.search("memory", "docker")
+        assert result["success"] is True
+        # tier1 has a "docker" match too, but search must never surface it --
+        # tier1 is already in context, searching it would be redundant.
+        assert all(r["tier"] != "tier1" for r in result["results"])
+
+    def test_search_case_insensitive_across_tier2_and_tier3_by_default(self, tiered_store):
+        result = tiered_store.search("memory", "DOCKER")
+        assert result["total_matches"] == 2  # tier2 "Docker networking" + tier3 "docker compose"
+        tiers_hit = {r["tier"] for r in result["results"]}
+        assert tiers_hit == {"tier2", "tier3"}
+
+    def test_search_narrowed_to_single_tier(self, tiered_store):
+        result = tiered_store.search("memory", "docker", tier="tier3")
+        assert result["total_matches"] == 1
+        assert result["results"][0]["tier"] == "tier3"
+
+    def test_search_no_match_returns_empty_not_error(self, tiered_store):
+        result = tiered_store.search("memory", "kubernetes")
+        assert result["success"] is True
+        assert result["total_matches"] == 0
+        assert result["results"] == []
+
+    def test_search_empty_query_rejected(self, tiered_store):
+        result = tiered_store.search("memory", "  ")
+        assert result["success"] is False
+
+    def test_search_invalid_tier_rejected(self, tiered_store):
+        result = tiered_store.search("memory", "docker", tier="tier1")
+        assert result["success"] is False
+
+    def test_search_result_cap_truncates_but_reports_true_total(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        s = MemoryStore(tier2_char_limit=10_000, tier3_char_limit=10_000)
+        s.load_from_disk()
+        many = [f"needle entry number {i}" for i in range(30)]
+        s._entries["memory"]["tier2"] = many
+        s.save_to_disk("memory", "tier2")
+        result = s.search("memory", "needle")
+        assert result["total_matches"] == 30
+        assert result["returned"] == s._SEARCH_RESULT_CAP
+        assert len(result["results"]) == s._SEARCH_RESULT_CAP
+
+    def test_memory_tool_dispatcher_search_action(self, tiered_store):
+        raw = memory_tool(action="search", target="memory", query="docker", store=tiered_store)
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["total_matches"] == 2
+
+    def test_memory_tool_dispatcher_search_requires_query(self, tiered_store):
+        raw = memory_tool(action="search", target="memory", store=tiered_store)
+        result = json.loads(raw)
+        assert result["success"] is False
+
+    def test_search_is_never_gated_by_write_approval(self, tmp_path, monkeypatch):
+        """search is read-only and must bypass the write-approval gate entirely
+        (gate only applies to add/replace/remove) -- confirmed by NOT staging
+        even when the gate is turned on."""
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        from tools import write_approval as wa
+        s = MemoryStore()
+        s.load_from_disk()
+        s._entries["memory"]["tier2"] = ["gated-search-target fact"]
+        s.save_to_disk("memory", "tier2")
+
+        orig = wa.evaluate_gate
+        gate_was_called = {"value": False}
+
+        def _tracking_gate(*args, **kwargs):
+            gate_was_called["value"] = True
+            return orig(*args, **kwargs)
+
+        monkeypatch.setattr(wa, "evaluate_gate", _tracking_gate)
+        raw = memory_tool(action="search", target="memory", query="gated-search", store=s)
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert gate_was_called["value"] is False
+
+
+class TestTier1OverflowMigration:
+    def test_legacy_flat_file_over_new_limit_migrates_on_load(self, tmp_path, monkeypatch):
+        """Simulates the real-world scenario: an existing MEMORY.md written
+        before tiering existed (or under a larger limit) that now exceeds the
+        configured tier1 limit. load_from_disk must migrate the overflow down
+        into tier2 rather than truncate/lose it.
+        """
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        entries = [f"legacy entry {i}: " + ("x" * 30) for i in range(10)]
+        (tmp_path / "MEMORY.md").write_text("\n§\n".join(entries), encoding="utf-8")
+
+        s = MemoryStore(memory_char_limit=150, tier2_char_limit=2000, tier3_char_limit=4000)
+        s.load_from_disk()
+
+        # tier1 must now be within its limit.
+        assert len(ENTRY_DELIMITER.join(s._entries_for("memory", "tier1"))) <= 150
+        # Nothing was lost: every legacy entry is still findable somewhere.
+        all_entries = s._all_entries_flat("memory")
+        for e in entries:
+            assert e in all_entries
+        # The newest entries (highest index, appended last) are the ones kept
+        # in tier1 -- migration demotes OLDEST first.
+        assert entries[-1] in s._entries_for("memory", "tier1")
+        assert entries[0] in s._entries_for("memory", "tier2")
+
+    def test_migration_persists_to_disk(self, tmp_path, monkeypatch):
+        """The re-tiered state must be written to the tier2 file, not just
+        held in memory -- a second load from a fresh store must see it too.
+        """
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        entries = [f"entry {i}: " + ("x" * 30) for i in range(10)]
+        (tmp_path / "MEMORY.md").write_text("\n§\n".join(entries), encoding="utf-8")
+
+        s1 = MemoryStore(memory_char_limit=150, tier2_char_limit=2000, tier3_char_limit=4000)
+        s1.load_from_disk()
+
+        s2 = MemoryStore(memory_char_limit=150, tier2_char_limit=2000, tier3_char_limit=4000)
+        s2.load_from_disk()
+        assert s2._entries_for("memory", "tier1") == s1._entries_for("memory", "tier1")
+        assert s2._entries_for("memory", "tier2") == s1._entries_for("memory", "tier2")
+
+    def test_migration_cascades_to_tier3_when_tier2_also_too_small(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        entries = [f"entry {i}: " + ("x" * 30) for i in range(10)]
+        (tmp_path / "MEMORY.md").write_text("\n§\n".join(entries), encoding="utf-8")
+
+        # tier2 is deliberately tiny -- most overflow must cascade to tier3.
+        s = MemoryStore(memory_char_limit=100, tier2_char_limit=80, tier3_char_limit=4000)
+        s.load_from_disk()
+
+        assert s._entries_for("memory", "tier3")  # some entries made it all the way to tier3
+        all_entries = s._all_entries_flat("memory")
+        for e in entries:
+            assert e in all_entries  # still nothing lost
+
+    def test_no_migration_needed_when_tier1_already_within_limit(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        (tmp_path / "MEMORY.md").write_text("short entry", encoding="utf-8")
+        s = MemoryStore(memory_char_limit=1200)
+        s.load_from_disk()
+        assert s._entries_for("memory", "tier1") == ["short entry"]
+        assert s._entries_for("memory", "tier2") == []
+        assert s._entries_for("memory", "tier3") == []
+
+    def test_cross_tier_dedup_on_load_keeps_higher_tier_copy(self, tmp_path, monkeypatch):
+        """If the same entry somehow exists in both tier1 and tier2 on disk
+        (e.g. a hand-edited file, or a migration re-run), load_from_disk
+        must dedup it down to the tier1 copy only.
+        """
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        (tmp_path / "MEMORY.md").write_text("shared fact", encoding="utf-8")
+        (tmp_path / "MEMORY.tier2.md").write_text("shared fact\n§\nunique tier2 fact", encoding="utf-8")
+        s = MemoryStore(memory_char_limit=1200, tier2_char_limit=1200)
+        s.load_from_disk()
+        assert s._entries_for("memory", "tier1") == ["shared fact"]
+        assert s._entries_for("memory", "tier2") == ["unique tier2 fact"]
+

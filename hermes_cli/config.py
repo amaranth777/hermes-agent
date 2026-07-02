@@ -2057,8 +2057,15 @@ DEFAULT_CONFIG = {
         #                     /memory reject <id>.
         # To disable memory entirely, use memory_enabled: false instead.
         "write_approval": False,
-        "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
-        "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        # Tiered cache: tier1 (memory_char_limit/user_char_limit) is the ONLY
+        # tier injected into the system prompt. tier2/tier3 are retrieval-only
+        # overflow (memory(action="search")) -- never enter the prompt, so
+        # they cost nothing per-turn. Overflow cascades tier1 -> tier2 ->
+        # tier3 automatically; nothing is ever silently deleted.
+        "memory_char_limit": 1200,   # tier1, ~440 tokens at 2.75 chars/token
+        "user_char_limit": 1200,     # tier1, ~440 tokens at 2.75 chars/token
+        "tier2_char_limit": 2400,    # tier2 overflow, applies to memory AND user independently
+        "tier3_char_limit": 4800,    # tier3 overflow (last stop before refusal), same per-target independence
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".

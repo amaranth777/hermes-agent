@@ -516,9 +516,17 @@ memory:
   # User profile: preferences, communication style, expectations
   user_profile_enabled: true
   
-  # Character limits (~2.75 chars per token, model-independent)
-  memory_char_limit: 2200   # ~800 tokens
-  user_char_limit: 1375     # ~500 tokens
+  # Tiered cache (~2.75 chars per token, model-independent):
+  #   tier1 (memory_char_limit / user_char_limit) is the ONLY tier injected
+  #   into the system prompt every turn -- keep it small and high-signal.
+  #   tier2/tier3 are retrieval-only overflow (memory(action="search")) and
+  #   never enter the prompt, so they're free per-turn. tier1 overflow
+  #   cascades automatically into tier2, then tier3; nothing is ever
+  #   silently deleted -- a full tier3 refuses the write with candidates.
+  memory_char_limit: 1200   # tier1, ~440 tokens
+  user_char_limit: 1200     # tier1, ~440 tokens
+  tier2_char_limit: 2400    # tier2 overflow (applies independently to memory and user)
+  tier3_char_limit: 4800    # tier3 overflow, last stop before a write is refused
 
   # Periodic memory nudge: remind the agent to consider saving memories
   # every N user turns. Set to 0 to disable. Only active when memory is enabled.
