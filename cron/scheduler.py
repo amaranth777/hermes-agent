@@ -2907,7 +2907,9 @@ def run_job(
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
     origin = _resolve_origin(job)
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    # Fixed session ID per job — reuse the same session across runs so
+    # cron activity doesn't create a new session entry every tick.
+    _cron_session_id = f"cron_{job_id}"
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -3331,6 +3333,17 @@ def run_job(
                 "Job '%s': MCP initialization failed (non-fatal): %s",
                 job_id, _mcp_exc,
             )
+
+        # Reopen the fixed session in SQLite (end_session may have closed it
+        # on the previous run). No-op if the session doesn't exist yet —
+        # AIAgent's session bootstrap will create it.
+        if _session_db:
+            try:
+                _session_db.reopen_session(_cron_session_id)
+            except Exception as _reopen_exc:
+                logger.debug(
+                    "Job '%s': reopen_session no-op or failed: %s", job_id, _reopen_exc
+                )
 
         agent = AIAgent(
             model=model,
