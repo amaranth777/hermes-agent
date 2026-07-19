@@ -995,10 +995,10 @@ class TestRunJobSessionPersistence:
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["session_db"] is fake_db
         assert kwargs["platform"] == "cron"
-        assert kwargs["session_id"].startswith("cron_test-job_")
+        assert kwargs["session_id"] == "cron_test-job"
         fake_db.end_session.assert_called_once()
         call_args = fake_db.end_session.call_args
-        assert call_args[0][0].startswith("cron_test-job_")
+        assert call_args[0][0] == "cron_test-job"
         assert call_args[0][1] == "cron_complete"
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
@@ -1121,7 +1121,7 @@ class TestRunJobSessionPersistence:
 
         fake_db.set_session_title.assert_called_once()
         sid, title = fake_db.set_session_title.call_args[0]
-        assert sid.startswith("cron_test-job_")
+        assert sid == "cron_test-job"
         assert "IMPORTANT" not in title
         assert title.startswith("Morning digest")
 
