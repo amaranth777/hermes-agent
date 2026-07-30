@@ -2364,6 +2364,7 @@ class TestWebServerEndpoints:
 
     def test_update_hermes_spawns_on_non_docker_install(self, monkeypatch):
         import hermes_cli.web_server as web_server
+        from hermes_cli.customization_update import UpdateResult
 
         class Proc:
             pid = 12345
@@ -2379,14 +2380,50 @@ class TestWebServerEndpoints:
 
         monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
         monkeypatch.setattr(web_server, "_spawn_hermes_action", fake_spawn)
+        monkeypatch.setattr(
+            "hermes_cli.customization_update.apply_customization_update",
+            lambda *_args, **_kwargs: UpdateResult(
+                changed=True,
+                strategy="rebase-customizations",
+                old_sha="a" * 40,
+                new_sha="b" * 40,
+                backup_ref="refs/hermes-backup/test",
+            ),
+        )
         web_server._ACTION_PROCS.pop("hermes-update", None)
         web_server._ACTION_RESULTS.pop("hermes-update", None)
 
         resp = self.client.post("/api/hermes/update")
 
         assert resp.status_code == 200
-        assert resp.json() == {"ok": True, "pid": 12345, "name": "hermes-update"}
-        assert calls == [(["update"], "hermes-update")]
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["pid"] == 12345
+        assert body["source_update"]["backup_ref"] == "refs/hermes-backup/test"
+        assert calls == [(["update", "--source-prepared"], "hermes-update")]
+
+    def test_update_hermes_does_not_spawn_when_git_safety_check_blocks(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.customization_update import UpdateBlocked
+
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        monkeypatch.setattr(
+            "hermes_cli.customization_update.apply_customization_update",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(UpdateBlocked("dirty_worktree")),
+        )
+        spawned = []
+        monkeypatch.setattr(
+            web_server,
+            "_spawn_hermes_action",
+            lambda *args: spawned.append(args),
+        )
+
+        body = self.client.post("/api/hermes/update").json()
+
+        assert body["ok"] is False
+        assert body["error"] == "customization_update_blocked"
+        assert "dirty_worktree" in body["message"]
+        assert spawned == []
 
     def test_action_status_reaps_completed_process(self, monkeypatch):
         import hermes_cli.web_server as web_server

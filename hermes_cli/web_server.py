@@ -3747,29 +3747,64 @@ async def update_hermes():
             "update_command": recommended_update_command_for_method(install_method),
         }
 
+    update_subcommand = ["update"]
+    prepared: Optional[Dict[str, Any]] = None
+    if install_method == "git":
+        from hermes_cli.customization_update import (
+            UpdateBlocked,
+            apply_customization_update,
+        )
+
+        try:
+            result = await asyncio.to_thread(
+                apply_customization_update, PROJECT_ROOT, fetch=True
+            )
+        except UpdateBlocked as exc:
+            message = str(exc)
+            _record_completed_action("hermes-update", message, exit_code=1)
+            return {
+                "ok": False,
+                "pid": None,
+                "name": "hermes-update",
+                "error": "customization_update_blocked",
+                "message": message,
+                "update_command": "resolve the reported git state, then retry",
+            }
+        prepared = {
+            "strategy": result.strategy,
+            "old_sha": result.old_sha,
+            "new_sha": result.new_sha,
+            "backup_ref": result.backup_ref,
+        }
+        update_subcommand.append("--source-prepared")
+
     try:
-        proc = _spawn_hermes_action(["update"], "hermes-update")
+        proc = _spawn_hermes_action(update_subcommand, "hermes-update")
     except Exception as exc:
         _log.exception("Failed to spawn hermes update")
         raise HTTPException(status_code=500, detail=f"Failed to start update: {exc}")
-    return {
+    response = {
         "ok": True,
         "pid": proc.pid,
         "name": "hermes-update",
     }
+    if prepared:
+        response["source_update"] = prepared
+    return response
 
 
-def _recent_upstream_commits(n: int = 20) -> List[Dict[str, Any]]:
-    """Commits the local checkout is behind ``origin/main`` by, newest first.
+def _recent_upstream_commits(
+    n: int = 20, upstream_ref: str = "origin/main"
+) -> List[Dict[str, Any]]:
+    """Commits the local checkout is behind ``upstream_ref`` by, newest first.
 
-    Logs the SAME range the behind-count uses (``HEAD..origin/main`` — see
-    ``banner._check_via_local_git``), NOT the branch's ``@{upstream}``. On a
-    feature-branch checkout ``@{upstream}`` is the branch's own tip (zero
-    commits), which would leave the changelog empty even though the count is
-    non-zero. Pinning to ``origin/main`` keeps count and changelog consistent.
+    Logs the SAME range the behind-count uses (``HEAD..upstream_ref``), NOT
+    the branch's ``@{upstream}``. On a feature-branch checkout the tracking
+    branch can be the fork's own tip (zero commits), which would leave the
+    changelog empty even though official upstream is ahead.
 
-    Best-effort: returns [] if not a git checkout, origin/main is unreachable,
-    or git is unavailable. Never raises into the request path.
+    Best-effort: returns [] if not a git checkout, the selected upstream ref is
+    unreachable, or git is unavailable. Never raises into the request path.
     """
     try:
         out = subprocess.run(
@@ -3779,7 +3814,7 @@ def _recent_upstream_commits(n: int = 20) -> List[Dict[str, Any]]:
                 str(PROJECT_ROOT),
                 "log",
                 "--format=%H%x1f%s%x1f%an%x1f%ct",
-                "HEAD..origin/main",
+                f"HEAD..{upstream_ref}",
                 f"-n{int(n)}",
             ],
             capture_output=True,
@@ -3862,6 +3897,47 @@ async def check_hermes_update(force: bool = False):
 
     if install_method == "docker":
         payload["message"] = format_docker_update_message()
+        return payload
+
+    if install_method == "git":
+        from hermes_cli.customization_update import (
+            UpdateBlocked,
+            analyze_with_preflight,
+            fetch_official_remote,
+            analyze_repository,
+        )
+
+        try:
+            state = await asyncio.to_thread(analyze_repository, PROJECT_ROOT)
+            if force and state.upstream_remote:
+                await asyncio.to_thread(
+                    fetch_official_remote, PROJECT_ROOT, state.upstream_remote
+                )
+            state = await asyncio.to_thread(analyze_with_preflight, PROJECT_ROOT)
+        except UpdateBlocked as exc:
+            payload["message"] = str(exc)
+            payload["can_apply"] = False
+            return payload
+
+        payload.update(state.to_dict())
+        payload["behind"] = state.behind
+        payload["update_available"] = bool((state.behind or 0) > 0)
+        payload["can_apply"] = state.can_apply
+        if (state.behind or 0) > 0:
+            payload["commits"] = await asyncio.to_thread(
+                _recent_upstream_commits, 20, state.upstream_ref or "origin/main"
+            )
+        if state.strategy == "none":
+            payload["message"] = "Official upstream is current; local customizations are preserved."
+        elif state.strategy == "fast-forward":
+            payload["message"] = "Official update can be fast-forwarded with a rollback ref."
+        elif state.strategy == "rebase-customizations":
+            payload["message"] = (
+                f"{state.custom_commit_count} local customization commit(s) will be "
+                "replayed onto official upstream after creating a rollback ref."
+            )
+        else:
+            payload["message"] = "Update blocked: " + ", ".join(state.blocking_reasons)
         return payload
 
     # banner.check_for_updates() handles git / pypi / nix-revision paths and

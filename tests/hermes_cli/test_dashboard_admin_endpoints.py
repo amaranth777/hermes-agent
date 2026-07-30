@@ -9,6 +9,26 @@ visible to the CLI data layer), not specific catalog values.
 
 import pytest
 
+from hermes_cli.customization_update import RepositoryUpdateState
+
+
+def _update_state(*, behind: int, custom: int = 0) -> RepositoryUpdateState:
+    return RepositoryUpdateState(
+        branch="local/customizations",
+        current_sha="a" * 40,
+        upstream_ref="upstream/main",
+        upstream_remote="upstream",
+        dirty=False,
+        behind=behind,
+        custom_commit_count=custom,
+        custom_commits=[],
+        diverged=behind > 0 and custom > 0,
+        strategy=("rebase-customizations" if custom else "fast-forward") if behind else "none",
+        can_apply=behind > 0,
+        blocking_reasons=[],
+        backup_required=behind > 0,
+    )
+
 
 def _client():
     try:
@@ -1048,10 +1068,10 @@ class TestUpdateCheckEndpoint:
         import hermes_cli.web_server as ws
 
         monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "git")
-        # Stub the shared checker so the contract is deterministic (no network).
-        import hermes_cli.banner as banner
-
-        monkeypatch.setattr(banner, "check_for_updates", lambda: 5)
+        monkeypatch.setattr(
+            "hermes_cli.customization_update.analyze_with_preflight",
+            lambda _root: _update_state(behind=5, custom=2),
+        )
 
         r = self.client.get("/api/hermes/update/check")
         assert r.status_code == 200
@@ -1073,10 +1093,12 @@ class TestUpdateCheckEndpoint:
 
     def test_up_to_date(self, monkeypatch):
         import hermes_cli.web_server as ws
-        import hermes_cli.banner as banner
 
         monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "git")
-        monkeypatch.setattr(banner, "check_for_updates", lambda: 0)
+        monkeypatch.setattr(
+            "hermes_cli.customization_update.analyze_with_preflight",
+            lambda _root: _update_state(behind=0),
+        )
 
         body = self.client.get("/api/hermes/update/check").json()
         assert body["behind"] == 0
@@ -1131,14 +1153,16 @@ class TestUpdateCheckEndpoint:
 
     def test_git_behind_includes_commits(self, monkeypatch):
         import hermes_cli.web_server as ws
-        import hermes_cli.banner as banner
 
         monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "git")
-        monkeypatch.setattr(banner, "check_for_updates", lambda: 3)
+        monkeypatch.setattr(
+            "hermes_cli.customization_update.analyze_with_preflight",
+            lambda _root: _update_state(behind=3),
+        )
         monkeypatch.setattr(
             ws,
             "_recent_upstream_commits",
-            lambda n=20: [
+            lambda n=20, upstream_ref="origin/main": [
                 {"sha": "abc1234", "summary": "feat: x", "author": "a", "at": 1},
             ],
         )
@@ -1151,10 +1175,12 @@ class TestUpdateCheckEndpoint:
 
     def test_up_to_date_omits_commits(self, monkeypatch):
         import hermes_cli.web_server as ws
-        import hermes_cli.banner as banner
 
         monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "git")
-        monkeypatch.setattr(banner, "check_for_updates", lambda: 0)
+        monkeypatch.setattr(
+            "hermes_cli.customization_update.analyze_with_preflight",
+            lambda _root: _update_state(behind=0),
+        )
 
         body = self.client.get("/api/hermes/update/check").json()
         # No commits list when there's nothing to show (additive, non-breaking).
