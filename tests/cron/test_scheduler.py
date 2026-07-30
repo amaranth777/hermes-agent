@@ -4944,6 +4944,35 @@ class TestMultiTargetDeliveryContinuesOnFailure:
         assert mock_pool.submit.call_count == 2
 
 
+class TestCrossPlatformDeliveryFallback:
+    def test_all_primary_targets_failed_uses_configured_fallback_once(self):
+        """A failed primary delivery retries once on its configured platform."""
+        from gateway.config import Platform
+
+        primary = MagicMock()
+        primary.enabled = True
+        fallback = MagicMock()
+        fallback.enabled = True
+        gateway_cfg = MagicMock()
+        gateway_cfg.platforms = {Platform.EMAIL: primary, Platform.TELEGRAM: fallback}
+        job = {"id": "fallback-job", "deliver": "email:primary@example.com"}
+        send = AsyncMock(side_effect=[{"error": "primary unavailable"}, {"success": True}])
+
+        with patch("gateway.config.load_gateway_config", return_value=gateway_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {
+                 "wrap_response": True,
+                 "delivery_fallbacks": {"email": "telegram:123"},
+             }}), \
+             patch("tools.send_message_tool._send_to_platform", new=send):
+            result = _deliver_result(job, "Report content")
+
+        assert result is None
+        assert send.await_count == 2
+        assert send.await_args_list[0].args[0] == Platform.EMAIL
+        assert send.await_args_list[1].args[0] == Platform.TELEGRAM
+        assert send.await_args_list[1].args[3] == "Report content"
+
+
 class TestSetCronSessionTitle:
     """Robust cron session titling: #50535/#50536/#50537."""
 

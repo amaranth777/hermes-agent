@@ -1239,6 +1239,30 @@ def _normalize_deliver_value(deliver) -> str:
     return str(deliver)
 
 
+def _resolve_delivery_fallback_values(
+    job: dict, cfg: dict | None, targets: list[dict]
+) -> list[str]:
+    """Resolve cross-platform fallbacks after every primary target fails."""
+    cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+    mappings = cron_cfg.get("delivery_fallbacks", {}) if isinstance(cron_cfg, dict) else {}
+    if not isinstance(mappings, dict):
+        return []
+
+    values: list[str] = []
+    for target in targets:
+        primary = str(target.get("platform") or "").lower()
+        fallback = mappings.get(primary)
+        if isinstance(fallback, str):
+            fallback = [fallback]
+        if not isinstance(fallback, (list, tuple)):
+            continue
+        for value in fallback:
+            value = str(value).strip()
+            if value and value.lower() != primary and value not in values:
+                values.append(value)
+    return values
+
+
 # Routing intent tokens — resolved at fire time, not create time, so a
 # job created before Telegram was wired up will pick up Telegram once it
 # comes online.  ``all`` expands into the set of connected platforms
@@ -1442,7 +1466,15 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    *,
+    _allow_cross_platform_fallback: bool = True,
+    _skip_wrap_response: bool = False,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -1489,7 +1521,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception:
         pass
 
-    if wrap_response:
+    if wrap_response and not _skip_wrap_response:
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
         delivery_content = (
@@ -1528,6 +1560,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         return msg
 
     delivery_errors = []
+    any_delivered = False
 
     for target in targets:
         platform_name = target["platform"]
@@ -1892,6 +1925,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
+                    any_delivered = True
                     # Seed the thread session only now that delivery into it
                     # succeeded (deferred from thread-open above).
                     if opened_thread_id and not thread_seeded:
@@ -2002,11 +2036,33 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+            any_delivered = True
             _maybe_mirror_cron_delivery(
                 job, platform_name, chat_id, mirror_text,
                 thread_id=thread_id, user_id=origin_user_id,
                 enabled=mirror_this_target and not thread_seeded,
             )
+
+    if delivery_errors and not any_delivered and _allow_cross_platform_fallback:
+        fallback_values = _resolve_delivery_fallback_values(job, user_cfg, targets)
+        if fallback_values:
+            fallback_job = dict(job)
+            fallback_job["deliver"] = ",".join(fallback_values)
+            logger.warning(
+                "Job '%s': all primary delivery targets failed; trying fallback targets %s",
+                job.get("id", "?"), fallback_values,
+            )
+            fallback_error = _deliver_result(
+                fallback_job,
+                content,
+                adapters=adapters,
+                loop=loop,
+                _allow_cross_platform_fallback=False,
+                _skip_wrap_response=True,
+            )
+            if fallback_error is None:
+                return None
+            delivery_errors.append(f"cross-platform fallback failed: {fallback_error}")
 
     if delivery_errors:
         return "; ".join(delivery_errors)
